@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     supabase_secret_key: str = Field(min_length=1, repr=False)
     environment: str = "development"
 
+    # DEBUG, INFO, WARNING, ERROR or CRITICAL. LOG_DIR="" disables the log files (console only).
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_dir: str = "logs"
+
     # Browser origins allowed to call the API, comma-separated (e.g. "https://shop.example.com").
     # Empty means "the local dev servers" in development, and is an error in production.
     cors_origins: str = ""

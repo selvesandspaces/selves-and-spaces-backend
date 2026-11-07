@@ -10,6 +10,7 @@ from supabase_auth.errors import AuthApiError
 from app.auth.deps import CurrentUser, get_current_user, require_roles
 from app.auth.roles import Role
 from app.config import get_settings
+from app.logging_config import setup_logging
 from app.orders.router import admin_router as admin_orders_router
 from app.orders.router import checkout_router
 from app.orders.router import router as orders_router
@@ -17,6 +18,7 @@ from app.payments.router import router as payments_router
 from app.products.router import router as products_router
 from app.users.router import router as users_router
 
+setup_logging(get_settings().log_level, get_settings().log_dir)
 logger = logging.getLogger(__name__)
 
 # Don't advertise the API surface in production.

@@ -4,11 +4,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from app.auth.deps import CurrentUser, require_roles
+from app.auth.deps import CurrentUser, get_active_customer, require_roles
 from app.auth.roles import Role
+from app.config import get_settings
 from app.supabase_client import get_supabase
 from app.users import service
-from app.users.schemas import UserOut
+from app.users.schemas import UserOut, UserUpdate
 
 logger = logging.getLogger("audit")
 
@@ -16,8 +17,31 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 SuperAdmin = Annotated[CurrentUser, Depends(require_roles(Role.SUPER_ADMIN))]
 
+Customer = Annotated[CurrentUser, Depends(get_active_customer)]
+
 # Supabase has no "disable user" flag; a very long ban is the documented way.
 DEACTIVATE_FOR = "876000h"  # ~100 years
+
+
+@router.patch("/me")
+def update_me(data: UserUpdate, user: Customer) -> UserOut:
+    changes = data.model_dump(exclude_unset=True, exclude_none=True)
+    if not changes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Send at least one field to update")
+    if "email" in changes and get_settings().require_confirmed_email:
+        # The admin API would switch the login email with no verification step.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Change your email from the sign-in client so a confirmation is sent",
+        )
+    admin = get_supabase().auth.admin
+    current = admin.get_user_by_id(user.id).user
+    attributes: dict = {"user_metadata": {**(current.user_metadata or {}), **{k: v for k, v in changes.items() if k != "email"}}}
+    if "email" in changes:
+        attributes["email"] = changes["email"]
+    updated = admin.update_user_by_id(user.id, attributes).user
+    logger.info("user.update actor=%s fields=%s", user.id, ",".join(sorted(changes)))
+    return UserOut.from_supabase(updated)
 
 
 @router.get("")

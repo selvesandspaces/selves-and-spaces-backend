@@ -173,3 +173,75 @@ def test_deactivating_unknown_user_is_404(setup):
     client, admin = setup()
     assert client.post(f"/users/{uuid4()}/deactivate").status_code == 404
     assert admin.updates == []
+
+
+# --- PATCH /users/me: a customer edits their own profile -------------------------------------
+
+
+class MetaAdmin(FakeAdmin):
+    def update_user_by_id(self, uid, attributes):
+        self.updates.append((uid, attributes))
+        user = self.users[uid]
+        if "user_metadata" in attributes:
+            user.user_metadata = attributes["user_metadata"]
+        if "email" in attributes:
+            user.email = attributes["email"]
+        return SimpleNamespace(user=user)
+
+
+@pytest.fixture
+def me(monkeypatch):
+    def build(require_confirmed_email=False):
+        customer = make_user(CUSTOMER_ID, "cust@example.com")
+        customer.user_metadata = {"theme": "dark"}
+        customer.email_confirmed_at = datetime.now(timezone.utc)
+        admin = MetaAdmin([customer])
+        fake = SimpleNamespace(auth=FakeAuth(admin, {"sub": CUSTOMER_ID, "app_metadata": {}}))
+        monkeypatch.setattr("app.auth.deps.get_supabase", lambda: fake)
+        monkeypatch.setattr("app.users.router.get_supabase", lambda: fake)
+        monkeypatch.setattr(
+            "app.auth.deps.get_settings", lambda: SimpleNamespace(require_confirmed_email=require_confirmed_email)
+        )
+        monkeypatch.setattr(
+            "app.users.router.get_settings", lambda: SimpleNamespace(require_confirmed_email=require_confirmed_email)
+        )
+        return TestClient(app, headers={"Authorization": "Bearer t.t.t"}), admin
+
+    return build
+
+
+ADDRESS = {"line1": "1 Main St", "city": "Chennai", "postal_code": "600001", "country": "India"}
+
+
+def test_customer_updates_own_profile_and_keeps_other_metadata(me):
+    client, admin = me()
+    r = client.patch("/users/me", json={"name": "Asha", "phone": "+91 98765 43210", "address": ADDRESS})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "Asha" and body["address"]["city"] == "Chennai"
+    assert admin.users[CUSTOMER_ID].user_metadata["theme"] == "dark"
+    assert "app_metadata" not in admin.updates[0][1]
+
+
+def test_roles_cannot_be_changed_through_profile_update(me):
+    client, admin = me()
+    r = client.patch("/users/me", json={"name": "Asha", "app_metadata": {"roles": ["super_admin"]}})
+    assert r.status_code == 422
+    assert admin.updates == []
+
+
+def test_empty_update_is_rejected(me):
+    client, _ = me()
+    assert client.patch("/users/me", json={}).status_code == 400
+
+
+def test_email_change_refused_when_confirmation_required(me):
+    client, admin = me(require_confirmed_email=True)
+    assert client.patch("/users/me", json={"email": "new@example.com"}).status_code == 400
+    assert admin.updates == []
+
+
+def test_email_change_allowed_when_confirmation_not_required(me):
+    client, admin = me(require_confirmed_email=False)
+    r = client.patch("/users/me", json={"email": "new@example.com"})
+    assert r.status_code == 200 and r.json()["email"] == "new@example.com"
