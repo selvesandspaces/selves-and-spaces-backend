@@ -168,6 +168,10 @@ class FakeDB:
             return None
         if c["order_id"]:
             return c["order_id"]
+        if c.get("status") == "failed":
+            from postgrest.exceptions import APIError
+
+            raise APIError({"message": "checkout_closed", "code": "P0001", "hint": None, "details": None})
         s = c["snapshot"]
         order = self.add_order(
             c["user_id"], customer_name=s["customer_name"], customer_email=s["customer_email"],
@@ -176,7 +180,19 @@ class FakeDB:
             items=[{"id": str(uuid4()), **i} for i in s["items"]],
         )
         c["order_id"] = order["id"]
+        c["status"] = "paid"
         return order["id"]
+
+    def _rpc_fail_checkout(self, params):
+        c = next((c for c in self.checkouts if c["razorpay_order_id"] == params["rzp_order_id"]), None)
+        if c is None:
+            return "not_found"
+        if c["order_id"]:
+            return "already_paid"
+        if c.get("status") == "failed":
+            return "already_failed"
+        c["status"], c["failure_reason"] = "failed", params["reason"]
+        return "ok"
 
     def _rpc_update_delivery_status(self, params):
         found = next((o for o in self.orders if o["id"] == params["oid"]), None)
@@ -328,12 +344,13 @@ def test_checkout_prices_cart_and_creates_no_order(alice, db):
     r = alice.post("/checkout", json=BODY)
     assert r.status_code == 201
     body = r.json()
-    assert body["amount"] == 20020 and body["currency"] == "INR" and body["total"] == "200.20"
+    assert body["amount"] == 20504 and body["currency"] == "INR" and body["total"] == "205.04"
+    assert body["subtotal"] == "200.20" and body["platform_fee"] == "4.84"
     assert body["razorpay_key_id"] == "rzp_test_dummy" and body["razorpay_order_id"].startswith("order_dummy")
     assert body["prefill"] == {"name": "Asha Rao", "email": "alice@example.com", "contact": "+91 98765 43210"}
     assert not db.orders  # nothing is an order until it is paid
     stored = db.checkouts[0]
-    assert stored["user_id"] == ALICE_ID and stored["amount_paise"] == 20020
+    assert stored["user_id"] == ALICE_ID and stored["amount_paise"] == 20504
     assert stored["razorpay_order_id"] == body["razorpay_order_id"]
 
 
@@ -343,7 +360,7 @@ def test_client_cannot_influence_price_owner_or_status(alice, db):
         "items": [{"product_id": PRODUCT_ID, "quantity": 1, "unit_price": "0.01"}],
     }
     r = alice.post("/checkout", json=evil)
-    assert r.status_code == 201 and r.json()["amount"] == 10010  # priced from the database
+    assert r.status_code == 201 and r.json()["amount"] == 10252  # priced from the database, plus the grossed-up platform fee
     assert db.checkouts[0]["user_id"] == ALICE_ID
     assert db.rpc_calls[0][1] == {"p": {"items": [{"product_id": PRODUCT_ID, "quantity": 1}]}}
 
@@ -414,7 +431,7 @@ def test_paying_creates_the_order(alice, db, gateway):
     order = r.json()
     assert order["razorpay_order_id"] == checkout["razorpay_order_id"]
     assert order["razorpay_payment_id"].startswith("pay_dummy") and order["paid_at"]
-    assert order["delivery_status"] == "order_placed" and order["total_amount"] == "200.20"
+    assert order["delivery_status"] == "order_placed" and order["total_amount"] == "205.04"
     assert order["items"][0]["line_total"] == "200.20"
     assert len(db.orders) == 1 and db.orders[0]["user_id"] == ALICE_ID
 
@@ -658,3 +675,93 @@ def test_deactivated_admin_cannot_change_orders(admin, db):
     o = db.add_order(ALICE_ID)
     db.users[ADMIN_ID].banned_until = "2999-01-01T00:00:00Z"
     assert admin.post(f"/admin/orders/{o['id']}/delivery-status", json={"status": "in_transit"}).status_code == 403
+
+
+# --- failed payments: one attempt per checkout -------------------------------
+
+
+def failed_event(checkout, payment_id="pay_bad1"):
+    entity = {"id": payment_id, "order_id": checkout["razorpay_order_id"], "status": "failed", "error_code": "BAD_REQUEST_ERROR"}
+    return {"event": "payment.failed", "payload": {"payment": {"entity": entity}}}
+
+
+def test_checkout_summary_has_line_totals(alice):
+    body = alice.post("/checkout", json=BODY).json()
+    assert body["items"][0]["line_total"] == "200.20" and body["subtotal"] == "200.20" and body["total"] == "205.04"
+
+
+def test_failed_payment_closes_checkout_and_creates_no_order(alice, db):
+    checkout = alice.post("/checkout", json=BODY).json()
+    r = alice.post("/checkout/failed", json={"razorpay_order_id": checkout["razorpay_order_id"], "reason": "card declined"})
+    assert r.status_code == 200 and r.json() == {"status": "failed", "order_id": None}
+    assert not db.orders
+
+
+def test_no_second_attempt_on_a_failed_checkout(alice, db, gateway):
+    checkout = alice.post("/checkout", json=BODY).json()
+    alice.post("/checkout/failed", json={"razorpay_order_id": checkout["razorpay_order_id"]})
+    assert pay(alice, gateway, checkout).status_code == 409
+    assert not db.orders
+    # A fresh checkout is the way to try again.
+    again = alice.post("/checkout", json=BODY).json()
+    assert pay(alice, gateway, again).status_code == 200
+
+
+def test_failure_report_cannot_undo_a_paid_checkout(alice, db, gateway):
+    checkout = alice.post("/checkout", json=BODY).json()
+    order_id = pay(alice, gateway, checkout).json()["id"]
+    r = alice.post("/checkout/failed", json={"razorpay_order_id": checkout["razorpay_order_id"]})
+    assert r.json() == {"status": "paid", "order_id": order_id}
+
+
+def test_failure_report_is_repeatable(alice, db):
+    checkout = alice.post("/checkout", json=BODY).json()
+    for _ in range(2):
+        r = alice.post("/checkout/failed", json={"razorpay_order_id": checkout["razorpay_order_id"]})
+        assert r.status_code == 200 and r.json()["status"] == "failed"
+
+
+def test_cannot_fail_or_read_someone_elses_checkout(alice, bob):
+    checkout = alice.post("/checkout", json=BODY).json()
+    rid = checkout["razorpay_order_id"]
+    assert bob.post("/checkout/failed", json={"razorpay_order_id": rid}).status_code == 404
+    assert bob.get(f"/checkout/{rid}").status_code == 404
+    assert alice.get(f"/checkout/{rid}").json()["status"] == "created"
+
+
+def test_checkout_status_reports_paid_with_order(alice, gateway):
+    checkout = alice.post("/checkout", json=BODY).json()
+    order_id = pay(alice, gateway, checkout).json()["id"]
+    assert alice.get(f"/checkout/{checkout['razorpay_order_id']}").json() == {"status": "paid", "order_id": order_id}
+
+
+def test_failed_webhook_closes_checkout(alice, db):
+    checkout = alice.post("/checkout", json=BODY).json()
+    assert webhook_post(None, failed_event(checkout)).json() == {"status": "failure_ok"}
+    assert db.checkouts[0]["status"] == "failed"
+    assert webhook_post(None, failed_event(checkout)).json() == {"status": "failure_already_failed"}
+
+
+def test_failed_webhook_needs_a_valid_signature(alice, db):
+    checkout = alice.post("/checkout", json=BODY).json()
+    assert webhook_post(None, failed_event(checkout), signature="nope").status_code == 400
+    assert db.checkouts[0].get("status") == "created"
+
+
+def test_failed_webhook_for_unknown_checkout_is_ignored(alice, db):
+    fake = {"razorpay_order_id": "order_unknown"}
+    assert webhook_post(None, failed_event(fake)).json() == {"status": "ignored_unknown_checkout"}
+
+
+def test_failed_webhook_after_payment_changes_nothing(alice, db, gateway):
+    checkout = alice.post("/checkout", json=BODY).json()
+    pay(alice, gateway, checkout)
+    assert webhook_post(None, failed_event(checkout)).json() == {"status": "failure_already_paid"}
+    assert len(db.orders) == 1
+
+
+def test_paid_webhook_after_failure_makes_no_order(alice, db):
+    checkout = alice.post("/checkout", json=BODY).json()
+    alice.post("/checkout/failed", json={"razorpay_order_id": checkout["razorpay_order_id"]})
+    assert webhook_post(None, captured(checkout)).json() == {"status": "ignored_closed_checkout"}
+    assert not db.orders

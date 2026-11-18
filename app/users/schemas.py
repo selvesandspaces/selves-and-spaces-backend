@@ -20,6 +20,13 @@ class UserUpdate(BaseModel):
     address: ShippingAddress | None = None
 
 
+class PasswordChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    new_password: Annotated[str, StringConstraints(min_length=8, max_length=256)]
+
+
 class UserOut(BaseModel):
     id: str
     email: str | None

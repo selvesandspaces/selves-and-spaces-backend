@@ -63,6 +63,16 @@ def update_product(product_id: UUID, data: ProductUpdate, current: SuperAdmin) -
     return _out(row)
 
 
+@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_product(product_id: UUID, current: SuperAdmin) -> Response:
+    try:
+        service.delete_product(get_supabase(), str(product_id))
+    except service.ProductNotFoundError as e:
+        raise _not_found(e) from e
+    logger.info("product.delete actor=%s product=%s", current.id, product_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post("/{product_id}/images", status_code=status.HTTP_201_CREATED)
 def upload_image(product_id: UUID, file: UploadFile, current: SuperAdmin) -> ImageOut:
     # Read one byte past the cap so oversize files are rejected without buffering them whole.

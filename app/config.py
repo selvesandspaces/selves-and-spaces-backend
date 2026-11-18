@@ -13,6 +13,8 @@ class Settings(BaseSettings):
 
     supabase_url: str = Field(min_length=1)
     supabase_secret_key: str = Field(min_length=1, repr=False)
+    # The public publishable key (sb_publishable_...). Only used to verify a user's current password.
+    supabase_publishable_key: str | None = Field(default=None, repr=False)
     environment: str = "development"
 
     # DEBUG, INFO, WARNING, ERROR or CRITICAL. LOG_DIR="" disables the log files (console only).

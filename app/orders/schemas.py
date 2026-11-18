@@ -65,11 +65,24 @@ class VerifyPayment(BaseModel):
     razorpay_signature: _text(1, 200)
 
 
+class FailedPayment(BaseModel):
+    """Sent by the browser when Razorpay Checkout reports a failed or abandoned payment."""
+
+    razorpay_order_id: _text(1, 100)
+    reason: _text(0, 200) | None = None
+
+
+class CheckoutStatusOut(BaseModel):
+    status: str  # created | paid | failed
+    order_id: UUID | None = None
+
+
 class CheckoutItemOut(BaseModel):
     product_id: UUID
     product_title: str
     unit_price: Decimal
     quantity: int
+    line_total: Decimal
 
 
 class Prefill(BaseModel):
@@ -86,7 +99,9 @@ class CheckoutOut(BaseModel):
     razorpay_order_id: str
     amount: int  # in paise, exactly what Razorpay will charge
     currency: str
-    total: Decimal
+    subtotal: Decimal  # the items alone
+    platform_fee: Decimal  # payment-processing fee passed on to the customer
+    total: Decimal  # subtotal + platform_fee, the amount charged
     items: list[CheckoutItemOut]
     prefill: Prefill
 
