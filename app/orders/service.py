@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
+
+from postgrest.exceptions import APIError as PostgrestError
 
 from app.money import money
 from app.orders.schemas import DeliveryStatus, OrderCreate, OrderOut
@@ -12,6 +14,16 @@ SELECT = "*, items:order_items(*)"
 # pile up so the endpoint can't be used to spam either.
 MAX_OPEN_CHECKOUTS_PER_HOUR = 10
 MIN_AMOUNT_PAISE = 100  # Razorpay's minimum is Rs 1.00
+
+# Razorpay's domestic fee (2%) plus 18% GST on that fee = 2.36% of what the customer pays. The fee is
+# grossed up (charged total = subtotal / (1 - rate)) so that after Razorpay deducts its cut of the
+# total, the shop keeps exactly the subtotal.
+PLATFORM_FEE_RATE = Decimal("0.02") * Decimal("1.18")
+
+
+def platform_fee(subtotal: Decimal) -> Decimal:
+    total = (subtotal / (1 - PLATFORM_FEE_RATE)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return total - subtotal
 
 
 class OrderNotFoundError(Exception):
@@ -32,6 +44,10 @@ class InvalidAmountError(Exception):
 
 class TooManyCheckoutsError(Exception):
     pass
+
+
+class CheckoutClosedError(Exception):
+    """The payment attempt already failed. It can never become an order; start a new checkout."""
 
 
 class InvalidTransitionError(Exception):
@@ -85,6 +101,7 @@ def start_checkout(db, gateway: Gateway, user_id: str, account_email: str | None
         .select("id")
         .eq("user_id", user_id)
         .is_("order_id", "null")
+        .eq("status", "created")
         .gte("created_at", since)
         .execute()
         .data
@@ -97,7 +114,9 @@ def start_checkout(db, gateway: Gateway, user_id: str, account_email: str | None
     if not quote:
         raise UnknownProductError()
 
-    total = Decimal(quote["total"])
+    subtotal = Decimal(quote["total"])
+    fee = platform_fee(subtotal)
+    total = subtotal + fee
     amount_paise = int(total * 100)  # exact: total has 2 decimal places
     if amount_paise < MIN_AMOUNT_PAISE:
         raise InvalidAmountError()
@@ -116,7 +135,10 @@ def start_checkout(db, gateway: Gateway, user_id: str, account_email: str | None
         "ship_state": a.state,
         "ship_postal_code": a.postal_code,
         "ship_country": a.country,
-        "total": quote["total"],
+        # `total` is what is charged and what the order records; it includes the platform fee.
+        "subtotal": quote["total"],
+        "platform_fee": str(fee),
+        "total": str(total),
         "items": quote["items"],
     }
     db.table("checkouts").insert(
@@ -126,6 +148,7 @@ def start_checkout(db, gateway: Gateway, user_id: str, account_email: str | None
             "razorpay_order_id": razorpay_order_id,
             "amount_paise": amount_paise,
             "currency": CURRENCY,
+            "status": "created",
             "snapshot": snapshot,
         }
     ).execute()
@@ -135,9 +158,12 @@ def start_checkout(db, gateway: Gateway, user_id: str, account_email: str | None
         "razorpay_order_id": razorpay_order_id,
         "amount": amount_paise,
         "currency": CURRENCY,
+        "subtotal": subtotal,
+        "platform_fee": fee,
         "total": total,
         "items": [
-            {**i, "unit_price": Decimal(i["unit_price"])} for i in quote["items"]
+            {**i, "unit_price": Decimal(i["unit_price"]), "line_total": money(Decimal(i["unit_price"]) * i["quantity"])}
+            for i in quote["items"]
         ],
         "prefill": {"name": snapshot["customer_name"], "email": snapshot["customer_email"], "contact": c.phone},
     }
@@ -155,14 +181,31 @@ def get_checkout(db, razorpay_order_id: str, user_id: str | None = None) -> dict
 
 def complete_checkout(db, razorpay_order_id: str, razorpay_payment_id: str) -> str:
     """Turn a paid checkout into an order. Idempotent: repeat calls return the same order id."""
-    order_id = (
-        db.rpc("complete_checkout", {"rzp_order_id": razorpay_order_id, "rzp_payment_id": razorpay_payment_id})
-        .execute()
-        .data
-    )
+    try:
+        order_id = (
+            db.rpc("complete_checkout", {"rzp_order_id": razorpay_order_id, "rzp_payment_id": razorpay_payment_id})
+            .execute()
+            .data
+        )
+    except PostgrestError as e:
+        if e.message == "checkout_closed":
+            raise CheckoutClosedError(razorpay_order_id) from e
+        raise
     if not order_id:
         raise CheckoutNotFoundError(razorpay_order_id)
     return order_id
+
+
+def fail_checkout(db, razorpay_order_id: str, reason: str | None) -> str:
+    """Close a checkout whose payment failed. Returns 'ok', 'already_paid' or 'already_failed'."""
+    outcome = (
+        db.rpc("fail_checkout", {"rzp_order_id": razorpay_order_id, "reason": (reason or "")[:200]})
+        .execute()
+        .data
+    )
+    if outcome == "not_found":
+        raise CheckoutNotFoundError(razorpay_order_id)
+    return outcome
 
 
 # --- orders (after payment) --------------------------------------------------------------------

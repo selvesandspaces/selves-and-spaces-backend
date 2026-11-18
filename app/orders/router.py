@@ -9,8 +9,10 @@ from app.auth.roles import Role
 from app.orders import service
 from app.orders.schemas import (
     CheckoutOut,
+    CheckoutStatusOut,
     DeliveryStatus,
     DeliveryUpdate,
+    FailedPayment,
     OrderCreate,
     OrderOut,
     VerifyPayment,
@@ -76,9 +78,47 @@ def verify_payment(data: VerifyPayment, user: Payer, gateway: PaymentGateway) ->
     ):
         logger.warning("checkout.bad_signature actor=%s razorpay_order=%s", user.id, data.razorpay_order_id)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Payment verification failed")
-    order_id = service.complete_checkout(db, data.razorpay_order_id, data.razorpay_payment_id)
+    try:
+        order_id = service.complete_checkout(db, data.razorpay_order_id, data.razorpay_payment_id)
+    except service.CheckoutClosedError as e:
+        # Only reachable if the customer was charged on an attempt we had already closed.
+        logger.error("checkout.paid_after_failure actor=%s razorpay_order=%s", user.id, data.razorpay_order_id)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This payment attempt was closed. Start a new checkout."
+        ) from e
     logger.info("order.paid via=verify actor=%s order=%s", user.id, order_id)
     return service.to_order_out(service.get_order(db, order_id))
+
+
+@checkout_router.post("/failed")
+def payment_failed(data: FailedPayment, user: Payer) -> CheckoutStatusOut:
+    """Step 2 when Razorpay Checkout reports a failure (or the customer closes it unpaid).
+
+    Closes the checkout: there is one payment attempt per checkout, so a retry means a new one.
+    Harmless to repeat, and it can never undo a payment that already succeeded.
+    """
+    db = get_supabase()
+    try:
+        service.get_checkout(db, data.razorpay_order_id, user_id=user.id)
+        outcome = service.fail_checkout(db, data.razorpay_order_id, data.reason)
+    except service.CheckoutNotFoundError as e:
+        raise _not_found() from e
+    logger.info("checkout.failed actor=%s razorpay_order=%s outcome=%s", user.id, data.razorpay_order_id, outcome)
+    return _checkout_status(db, data.razorpay_order_id, user.id)
+
+
+@checkout_router.get("/{razorpay_order_id}")
+def checkout_status(razorpay_order_id: str, user: Payer) -> CheckoutStatusOut:
+    """Where this checkout stands: created (awaiting payment), paid (with its order) or failed."""
+    try:
+        return _checkout_status(get_supabase(), razorpay_order_id, user.id)
+    except service.CheckoutNotFoundError as e:
+        raise _not_found() from e
+
+
+def _checkout_status(db, razorpay_order_id: str, user_id: str) -> CheckoutStatusOut:
+    row = service.get_checkout(db, razorpay_order_id, user_id=user_id)
+    return CheckoutStatusOut(status=row.get("status", "created"), order_id=row.get("order_id"))
 
 
 # --- customers: view their OWN orders -----------------------------------------------------------

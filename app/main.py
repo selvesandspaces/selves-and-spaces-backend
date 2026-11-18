@@ -9,6 +9,7 @@ from supabase_auth.errors import AuthApiError
 
 from app.auth.deps import CurrentUser, get_current_user, require_roles
 from app.auth.roles import Role
+from app.clients.router import admin_router as admin_clients_router
 from app.config import get_settings
 from app.logging_config import setup_logging
 from app.orders.router import admin_router as admin_orders_router
@@ -44,6 +45,7 @@ app.include_router(checkout_router)
 app.include_router(orders_router)
 app.include_router(admin_orders_router)
 app.include_router(payments_router)
+app.include_router(admin_clients_router)
 
 
 @app.exception_handler(AuthApiError)

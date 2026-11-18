@@ -348,3 +348,26 @@ def test_cannot_delete_image_through_another_product(as_admin, db):
 def test_detect_image_type():
     assert service.detect_image_type(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == ("image/webp", "webp")
     assert service.detect_image_type(b"GIF89a") is None
+
+
+# --- delete product ---------------------------------------------------------
+
+
+def test_super_admin_deletes_product_and_its_files(as_admin, db):
+    pid = as_admin.post("/products", json=BODY).json()["id"]
+    db.tables["product_images"].append({"id": str(uuid4()), "product_id": pid, "storage_path": f"{pid}/a.jpg"})
+    db.files[f"{pid}/a.jpg"] = (JPEG, {})
+    assert as_admin.delete(f"/products/{pid}").status_code == 204
+    assert db.tables["products"] == []
+    assert db.files == {}
+    assert as_admin.get(f"/products/{pid}").status_code == 404
+
+
+def test_delete_unknown_product_is_404(as_admin):
+    assert as_admin.delete(f"/products/{uuid4()}").status_code == 404
+
+
+def test_customer_and_anonymous_cannot_delete_product(as_customer, anon):
+    pid = uuid4()
+    assert as_customer.delete(f"/products/{pid}").status_code == 403
+    assert anon.delete(f"/products/{pid}").status_code in (401, 403)

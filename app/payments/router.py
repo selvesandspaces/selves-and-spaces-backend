@@ -16,6 +16,7 @@ logger = logging.getLogger("audit")
 router = APIRouter(tags=["payments"])
 
 PAID_EVENTS = {"payment.captured", "order.paid"}
+FAILED_EVENT = "payment.failed"
 
 
 def process_webhook(db, gateway: Gateway, body: bytes, signature: str) -> str:
@@ -31,12 +32,15 @@ def process_webhook(db, gateway: Gateway, body: bytes, signature: str) -> str:
 
     try:
         event = json.loads(body)
-        if event.get("event") not in PAID_EVENTS:
+        kind = event.get("event")
+        if kind not in PAID_EVENTS and kind != FAILED_EVENT:
             return "ignored_event"
         payment = event["payload"]["payment"]["entity"]
         order_id, payment_id = payment["order_id"], payment["id"]
     except (ValueError, KeyError, TypeError, AttributeError):
         return "ignored_malformed"
+    if kind == FAILED_EVENT:
+        return _record_failure(db, order_id, payment_id, payment.get("error_code"))
     if payment.get("status") != "captured":
         return "ignored_not_captured"
 
@@ -51,9 +55,26 @@ def process_webhook(db, gateway: Gateway, body: bytes, signature: str) -> str:
         logger.error("webhook.amount_mismatch razorpay_order=%s payment=%s", order_id, payment_id)
         return "ignored_amount_mismatch"
 
-    new_order = service.complete_checkout(db, order_id, payment_id)
+    try:
+        new_order = service.complete_checkout(db, order_id, payment_id)
+    except service.CheckoutClosedError:
+        # The customer was charged on an attempt we had already closed: needs a manual refund.
+        logger.error("webhook.paid_after_failure razorpay_order=%s payment=%s", order_id, payment_id)
+        return "ignored_closed_checkout"
     logger.info("order.paid via=webhook order=%s", new_order)
     return "completed"
+
+
+def _record_failure(db, order_id: str, payment_id: str, error_code: str | None) -> str:
+    # Razorpay lets the customer retry inside Checkout, so a failure here can be followed by a
+    # success on the same order. Our rule is one attempt per checkout: the first failure closes it.
+    try:
+        outcome = service.fail_checkout(db, order_id, error_code)
+    except service.CheckoutNotFoundError:
+        logger.warning("webhook.unknown_checkout razorpay_order=%s", order_id)
+        return "ignored_unknown_checkout"
+    logger.info("checkout.failed via=webhook razorpay_order=%s payment=%s outcome=%s", order_id, payment_id, outcome)
+    return f"failure_{outcome}"
 
 
 @router.post("/webhooks/razorpay")
@@ -88,3 +109,19 @@ def simulate_payment(
     except service.CheckoutNotFoundError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found") from e
     return gateway.simulate_payment(data.razorpay_order_id)
+
+
+@router.post("/dev/razorpay/simulate-failure", include_in_schema=False)
+def simulate_failure(
+    data: SimulatePayment,
+    user: Annotated[CurrentUser, Depends(get_active_customer)],
+    gateway: Annotated[Gateway, Depends(get_gateway)],
+) -> dict:
+    """Dummy mode only: what Razorpay Checkout's payment.failed handler would hand the browser."""
+    if not isinstance(gateway, DummyGateway):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    try:
+        service.get_checkout(get_supabase(), data.razorpay_order_id, user_id=user.id)
+    except service.CheckoutNotFoundError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found") from e
+    return {"razorpay_order_id": data.razorpay_order_id, "reason": "dummy_payment_failed"}

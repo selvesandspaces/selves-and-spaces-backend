@@ -131,3 +131,16 @@ def delete_image(db, product_id: str, image_id: str) -> None:
     if not rows:
         raise ProductNotFoundError(image_id)
     db.storage.from_(BUCKET).remove([rows[0]["storage_path"]])
+
+
+def delete_product(db, product_id: str) -> None:
+    """Hard delete. Details/images cascade in SQL; order items keep their snapshot (product_id -> null)."""
+    paths = [
+        r["storage_path"]
+        for r in db.table("product_images").select("storage_path").eq("product_id", product_id).execute().data
+    ]
+    rows = db.table("products").delete().eq("id", product_id).execute().data
+    if not rows:
+        raise ProductNotFoundError(product_id)
+    if paths:
+        db.storage.from_(BUCKET).remove(paths)

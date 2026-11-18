@@ -89,3 +89,20 @@ def ensure_single_super_admin(admin, email: str, password: str | None = None) ->
             "app_metadata": app_metadata,
         }
     ).user
+
+
+class WrongPasswordError(Exception):
+    pass
+
+
+def change_password(admin, publishable_client, user_id: str, email: str, current: str, new: str) -> None:
+    """Verify `current` by signing in with the public key, then set `new` through the admin API."""
+    from supabase_auth.errors import AuthApiError
+
+    try:
+        publishable_client.auth.sign_in_with_password({"email": email, "password": current})
+    except AuthApiError as e:
+        if e.status in (400, 401, 422):
+            raise WrongPasswordError from e
+        raise
+    admin.update_user_by_id(user_id, {"password": new})

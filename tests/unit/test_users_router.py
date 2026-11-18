@@ -245,3 +245,57 @@ def test_email_change_allowed_when_confirmation_not_required(me):
     client, admin = me(require_confirmed_email=False)
     r = client.patch("/users/me", json={"email": "new@example.com"})
     assert r.status_code == 200 and r.json()["email"] == "new@example.com"
+
+
+# --- change password / super admin email -----------------------------------
+
+
+class FakePublishable:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.auth = self
+
+    def sign_in_with_password(self, creds):
+        if not self.ok:
+            raise AuthApiError("Invalid login credentials", 400, "invalid_credentials")
+
+
+@pytest.fixture
+def password_env(monkeypatch):
+    monkeypatch.setattr("app.users.router.get_settings", lambda: SimpleNamespace(supabase_publishable_key="sb_publishable_x", require_confirmed_email=True))
+
+
+def test_super_admin_changes_password(setup, password_env, monkeypatch):
+    client, admin = setup()
+    monkeypatch.setattr("app.users.router.new_publishable_client", lambda: FakePublishable(ok=True))
+    r = client.post("/users/me/password", json={"current_password": "old-password", "new_password": "new-password-1"})
+    assert r.status_code == 204
+    assert admin.updates[-1] == (ADMIN_ID, {"password": "new-password-1"})
+
+
+def test_wrong_current_password_is_rejected(setup, password_env, monkeypatch):
+    client, admin = setup()
+    monkeypatch.setattr("app.users.router.new_publishable_client", lambda: FakePublishable(ok=False))
+    r = client.post("/users/me/password", json={"current_password": "nope", "new_password": "new-password-1"})
+    assert r.status_code == 400
+    assert admin.updates == []
+
+
+def test_weak_or_same_password_is_rejected(setup, password_env):
+    client, _ = setup()
+    assert client.post("/users/me/password", json={"current_password": "a", "new_password": "short"}).status_code == 422
+    assert client.post("/users/me/password", json={"current_password": "same-password", "new_password": "same-password"}).status_code == 400
+
+
+def test_customer_cannot_change_password_here(setup, password_env):
+    client, _ = setup(caller_id=CUSTOMER_ID, caller_roles=())
+    r = client.post("/users/me/password", json={"current_password": "x", "new_password": "new-password-1"})
+    assert r.status_code == 403
+
+
+def test_super_admin_can_change_email_even_when_confirmation_required(setup, password_env):
+    client, admin = setup()
+    r = client.patch("/users/me", json={"email": "new@example.com"})
+    assert r.status_code == 200
+    assert admin.updates[-1][1]["email"] == "new@example.com"
+    assert admin.updates[-1][1]["email_confirm"] is True
